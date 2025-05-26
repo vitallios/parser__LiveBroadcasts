@@ -30,34 +30,15 @@ CONFIG = {
 }
 
 CATEGORIES = {
-    "⚽️ Футбол": ["Футбол", "Лига чемпионов", "Премьер-лига", "Суперлига", "Бундеслига", "Медиалига"],
-    "🎾 Теннис": ["ATP", "Теннис", "WTA", "US Open", "Ролан Гаррос"],
-    "🚴 Велоспорт": ["Велоспорт"],
-    "🏓 Гольф": ["Гольф"],
-    "🏒 Хоккей": ["ВХЛ", "ХК", "МХЛ", "КХЛ", "ЖХЛ", "хоккей"],
-    "🏀 Баскетбол": ["Баскетбол", "НБА", "Евролига"],
-    "🏉 Регби": ["Регби", "Про Д2"],
-    "🤾 Гандбол": ["Гандбол"],
-    "🥊 Единоборства": ["единоборства","боксу","UFC","MMA","Тайский бокс"],
-    "🏏 Волейбол": ["Волейбол"],
-    "🎳 Шахматы": ["Шахматы"],
-    "🏆 Другое": []
-}
-
-# Эмодзи для категорий
-CATEGORY_EMOJIS = {
-    "футбол": "⚽️",
-    "теннис": "🎾",
-    "велоспорт": "🚴",
-    "гольф": "🏓",
-    "хоккей": "🏒",
-    "баскетбол": "🏀",
-    "регби": "🏉",
-    "гандбол": "🤾",
-    "единоборства": "🥊",    
-    "волейбол": "🏏",
-    "шахматы": "🎳",
-    "другое": "🏟️"
+    "хоккей": ["ВХЛ", "ХК", "МХЛ", "КХЛ", "ЖХЛ", "хоккей"],
+    "баскетбол": ["Баскетбол", "НБА", "Евролига"],
+    "теннис": ["ATP", "Теннис", "WTA", "US Open", "Ролан Гаррос"],
+    "регби": ["Регби", "Про Д2"],
+    "футбол": ["Футбол", "Лига чемпионов", "Премьер-лига"],
+    "велоспорт": ["Велоспорт"],
+    "гандбол": ["Гандбол"],
+    "бокс": ["боксу"],
+    "другое": []
 }
 
 class SportStreamParser:
@@ -135,14 +116,13 @@ class SportStreamParser:
 
         return time_text, iframe_html
 
-    def _clean_title(self, title):
-        """Очищает заголовок от лишних слов"""
+    def _clean_title(self, title, date_str, time_str):
         words_to_remove = [
             'Смотреть', 'онлайн', 'трансляция', 'эфир',
-            'в', 'мск', '—', 'прямая', 'прямой'
+            date_str.strftime("%d.%m.%Y"), time_str, 'в', 'мск', '—'
         ]
         words = title.split()
-        return ' '.join(w for w in words if w.lower() not in words_to_remove)
+        return ' '.join(w for w in words if w not in words_to_remove)
 
     def _process_post(self, post):
         try:
@@ -170,22 +150,28 @@ class SportStreamParser:
                 return None
             time_str = time_match.group(1)
 
-            clean_title = self._clean_title(title)
+            clean_title = self._clean_title(title, event_date, time_str)
             if not clean_title:
                 return None
 
-            # Определяем категорию
             category = "другое"
             for cat, keywords in CATEGORIES.items():
-                if any(kw.lower() in title.lower() for kw in keywords):
+                if any(kw.lower() in clean_title.lower() for kw in keywords):
                     category = cat
                     break
+
+            img = post.find('img', {'src': True})
+            img_src = img['src'] if img else None
 
             return {
                 "category": category,
                 "name": clean_title,
+                "link": iframe,
+                "data": event_date.strftime("%Y.%m.%d"),
                 "time": time_str,
-                "original_title": title
+                "img": img_src,
+                "premium": "",
+                "active": 0
             }
 
         except Exception as e:
@@ -204,10 +190,19 @@ class SportStreamParser:
                 categorized[item['category']] = []
             categorized[item['category']].append(item)
 
-        # Сортируем категории по порядку в CATEGORIES
-        sorted_categories = sorted(categorized.keys(), 
-                                 key=lambda x: list(CATEGORIES.keys()).index(x) 
-                                 if x in CATEGORIES else len(CATEGORIES))
+        # Эмодзи для категорий
+        category_emojis = {
+            "футбол": "⚽️",
+            "теннис": "🎾",
+            "хоккей": "🏒",
+            "баскетбол": "🏀",
+            "велоспорт": "🚴",
+            "гольф": "🏓",
+            "регби": "🏉",
+            "гандбол": "🤾",
+            "бокс": "🥊",
+            "другое": "🏟️"
+        }
 
         # Формируем пост
         post_lines = [
@@ -217,16 +212,18 @@ class SportStreamParser:
             ""
         ]
 
+        # Сортируем категории по порядку из примера
+        preferred_order = ["футбол", "теннис", "хоккей", "баскетбол", "велоспорт", "гольф", "регби", "гандбол", "бокс"]
+        sorted_categories = sorted(
+            categorized.keys(),
+            key=lambda x: preferred_order.index(x) if x in preferred_order else len(preferred_order))
+        
         for category in sorted_categories:
-            emoji = CATEGORY_EMOJIS.get(category, "🏟️")
+            emoji = category_emojis.get(category, "🏟️")
             post_lines.append(f"{emoji} {category.capitalize()}")
             
-            # Сортируем трансляции по времени
-            sorted_events = sorted(categorized[category], key=lambda x: x['time'])
-            
-            for event in sorted_events:
-                post_lines.append(f"⏰ {event['time']} - {event['name']}")
-            
+            for item in categorized[category]:
+                post_lines.append(f"⏰ {item['time']} - {item['name']}")
             post_lines.append("")  # Пустая строка после категории
 
         # Добавляем финальные строки
