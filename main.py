@@ -2,276 +2,273 @@ import requests
 import json
 import re
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import logging
-from typing import Optional, Dict, List, Tuple
-import ssl
+import sys
+import io
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('parser.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler('parser.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
+# Конфигурация
+CONFIG = {
+    'base_url': 'https://srrb.ru/category/translyacii-sportivnyx-sobytij',
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'timeout': 15,
+    'max_workers': 4,
+    'retry_strategy': {
+        'total': 3,
+        'backoff_factor': 1,
+        'status_forcelist': [500, 502, 503, 504]
+    },
+    'verify_ssl': False
+}
+
+CATEGORIES = {
+    "хоккей": ["ВХЛ", "ХК", "МХЛ", "КХЛ", "ЖХЛ", "хоккей"],
+    "баскетбол": ["Баскетбол", "НБА", "Евролига"],
+    "теннис": ["ATP", "Теннис", "WTA", "US Open", "Ролан Гаррос", "Уимблдон"],
+    "регби": ["Регби", "Про Д2"],
+    "футбол": ["Футбол", "Лига чемпионов", "Премьер-лига"],
+    "велоспорт": ["Велоспорт"],
+    "гандбол": ["Гандбол"],
+    "бокс": ["боксу"],
+    "другое": []
+}
+
 class SportStreamParser:
     def __init__(self):
-        self.session = self._configure_session()
-        self.streams = []
+        self.session = self._create_session()
+        self.strime_list = []
         self.today = datetime.now().date()
-        self.tomorrow = (datetime.now() + timedelta(days=1)).date()
-        self.base_url = "https://srrb.ru/category/translyacii-sportivnyx-sobytij"
-        
-        # Система категорий с ключевыми словами и эмодзи
-        self.categories = {
-            "хоккей": {
-                "keywords": ["ВХЛ", "ХК", "МХЛ", "КХЛ", "ЖХЛ", "хоккей", "НХЛ"],
-                "emoji": "🏒"
-            },
-            "футбол": {
-                "keywords": ["Футбол", "Лига чемпионов", "Премьер-лига", "Чемпионат мира"],
-                "emoji": "⚽"
-            },
-            "теннис": {
-                "keywords": ["Теннис", "ATP", "WTA", "US Open", "Ролан Гаррос"],
-                "emoji": "🎾"
-            },
-            "баскетбол": {
-                "keywords": ["Баскетбол", "НБА", "Евролига"],
-                "emoji": "🏀"
-            },
-            "Велоспорт": {
-                "keywords": ["Велоспорт"],
-                "emoji": "🚴‍♀️"
-            },
-            "другое": {
-                "keywords": [],
-                "emoji": "🏟"
-            }
-        }
+        self.today_str = self.today.strftime("%d.%m.%Y")
 
-    def _configure_session(self) -> requests.Session:
-        """Настраивает HTTP-сессию с обработкой SSL"""
+    def _create_session(self):
         session = requests.Session()
-        
-        # Настройка повторных попыток
         retry = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504, 429]
+            total=CONFIG['retry_strategy']['total'],
+            backoff_factor=CONFIG['retry_strategy']['backoff_factor'],
+            status_forcelist=CONFIG['retry_strategy']['status_forcelist']
         )
         adapter = HTTPAdapter(max_retries=retry)
         session.mount('http://', adapter)
         session.mount('https://', adapter)
-        
-        # Заголовки
         session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+            'User-Agent': CONFIG['user_agent'],
+            'Accept-Language': 'ru-RU,ru;q=0.9',
+            'Accept-Encoding': 'gzip, deflate'
         })
-        
-        # Отключение проверки SSL только для целевого домена
-        original_send = session.send
-        
-        def custom_send(request, **kwargs):
-            if "srrb.ru" in request.url:
-                kwargs['verify'] = False
-            return original_send(request, **kwargs)
-        
-        session.send = custom_send
-        
         return session
 
-    def _parse_date(self, text: str) -> Optional[datetime.date]:
-        """Парсит дату из текста в различных форматах"""
-        # Формат DD.MM.YYYY
-        if match := re.search(r'(\d{2})\.(\d{2})\.(\d{4})', text):
-            day, month, year = map(int, match.groups())
-            return datetime(year, month, day).date()
-        
-        # Формат "1 января 2023"
-        months = {
-            'январ': '01', 'феврал': '02', 'март': '03',
-            'апрел': '04', 'мая': '05', 'июн': '06',
-            'июл': '07', 'август': '08', 'сентябр': '09',
-            'октябр': '10', 'ноябр': '11', 'декабр': '12'
-        }
-        
-        for month_ru, month_num in months.items():
-            pattern = rf'(\d{{1,2}})\s*{month_ru}[а-я]*\s*(\d{{4}})'
-            if match := re.search(pattern, text, re.IGNORECASE):
-                day, year = map(int, match.groups())
-                return datetime(year, int(month_num), day).date()
-        
-        return None
-
-    def _extract_stream_info(self, url: str) -> Tuple[Optional[str], Optional[str]]:
-        """Извлекает информацию о времени и iframe трансляции"""
+    def _get_page(self, url):
         try:
-            response = self.session.get(url, timeout=15)
+            response = self.session.get(url, timeout=CONFIG['timeout'], verify=CONFIG['verify_ssl'])
+            response.encoding = 'utf-8'
             response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Поиск времени трансляции
-            time_patterns = [
-                r'начало\s*в\s*(\d{1,2}:\d{2})',
-                r'в\s*(\d{1,2}:\d{2})\s*мск',
-                r'трансляция\s*с\s*(\d{1,2}:\d{2})'
-            ]
-            
-            time_text = None
-            for p in soup.find_all('p'):
-                text = p.get_text().lower()
-                for pattern in time_patterns:
-                    if match := re.search(pattern, text):
-                        time_text = match.group(1)
-                        break
-                if time_text:
-                    break
-            
-            # Поиск iframe с трансляцией
-            iframe = soup.find('iframe', {'src': True})
-            iframe_html = str(iframe) if iframe else None
-            
-            return time_text, iframe_html
-            
+            return BeautifulSoup(response.text, 'html.parser')
         except Exception as e:
-            logger.warning(f"Ошибка при обработке {url}: {str(e)}")
+            logger.warning(f"Ошибка загрузки {url}: {str(e)}")
+            return None
+
+    def _get_stream_info(self, url):
+        soup = self._get_page(url)
+        if not soup:
             return None, None
 
-    def _process_event(self, event_element) -> Optional[Dict]:
-        """Обрабатывает отдельное событие"""
+        # Поиск времени в контенте
+        time_text = None
+        content = soup.find('div', class_='entry-content')
+        if content:
+            for p in content.find_all('p'):
+                text = p.get_text().lower()
+                if any(kw in text for kw in ['прямой эфир', 'начало', 'трансляция', 'мск']):
+                    time_match = re.search(r'(\d{1,2}:\d{2})', text)
+                    if time_match:
+                        time_text = time_match.group(1)
+                        break
+
+        # Поиск iframe
+        iframe = soup.find('iframe', {'src': True})
+        iframe_html = str(iframe) if iframe else None
+
+        return time_text, iframe_html
+
+    def _process_post(self, post):
         try:
-            link = event_element.find('a', href=True)
-            if not link:
+            # Извлечение основного контента
+            title_tag = post.find('h3').find('a')
+            if not title_tag:
                 return None
                 
-            title = link.get_text(strip=True)
-            event_date = self._parse_date(title)
+            title = title_tag.get_text().strip()
+            link = title_tag['href']
             
-            # Фильтр по дате (сегодня или завтра)
-            if not event_date or event_date not in (self.today, self.tomorrow):
+            # Извлечение даты из метаданных
+            date_tag = post.find('span', class_='item-metadata posts-date').find('a')
+            if not date_tag:
                 return None
                 
-            time_text, iframe = self._extract_stream_info(link['href'])
-            if not time_text or not iframe:
+            try:
+                post_date = datetime.strptime(date_tag.get_text().strip(), "%d.%m.%Y").date()
+            except ValueError:
                 return None
                 
-            # Определение категории (сохраняем оригинальное название)
+            # Проверка что событие сегодня
+            if post_date != self.today:
+                logger.debug(f"Пропущена трансляция: {title} (дата: {post_date})")
+                return None
+                
+            # Извлечение изображения
+            img_tag = post.find('img')
+            img_src = img_tag['src'] if img_tag else None
+            
+            # Извлечение категории
+            category_tag = post.find('li', class_='meta-category').find('a')
+            category_text = category_tag.get_text().strip() if category_tag else ""
+            
+            # Получение времени из заголовка
+            time_match = re.search(r'в (\d{1,2}:\d{2})', title)
+            time_str = time_match.group(1) if time_match else None
+            
+            # Если время не найдено в заголовке, ищем на странице
+            if not time_str:
+                time_str, iframe = self._get_stream_info(link)
+            else:
+                _, iframe = self._get_stream_info(link)
+                
+            if not iframe:
+                return None
+                
+            # Определение категории
             category = "другое"
-            for cat_name, cat_data in self.categories.items():
-                if any(kw.lower() in title.lower() for kw in cat_data['keywords']):
-                    category = cat_name
+            for cat, keywords in CATEGORIES.items():
+                if any(kw.lower() in category_text.lower() or kw.lower() in title.lower() for kw in keywords):
+                    category = cat
                     break
                     
-            # Изображение
-            img = event_element.find('img', src=True)
+            # Очистка названия
+            clean_title = re.sub(r'\. Прямая трансляция \d{2}\.\d{2}\.\d{4} в \d{1,2}:\d{2}', '', title)
+            clean_title = clean_title.replace('Смотреть онлайн:', '').strip()
             
             return {
                 "category": category,
-                "name": title,
+                "name": clean_title,
                 "link": iframe,
-                "data": event_date.strftime("%Y.%m.%d"),
-                "time": time_text,
-                "img": img['src'] if img else None,
+                "data": post_date.strftime("%Y.%m.%d"),
+                "time": time_str,
+                "img": img_src, 
                 "premium": "",
                 "active": 0
             }
             
         except Exception as e:
-            logger.error(f"Ошибка обработки события: {str(e)}")
+            logger.error(f"Ошибка обработки поста: {str(e)}", exc_info=True)
             return None
 
-    def generate_telegram_post(self) -> str:
-        """Генерирует текст для Telegram-поста"""
-        if not self.streams:
-            return "📺 На сегодня спортивных трансляций не найдено"
-            
-        # Группировка по категориям
-        grouped = {}
-        for stream in self.streams:
-            if stream['category'] not in grouped:
-                grouped[stream['category']] = []
-            grouped[stream['category']].append(stream)
-            
-        # Сортировка по времени
-        for category in grouped.values():
-            category.sort(key=lambda x: x['time'])
-            
-        # Формирование поста
-        lines = [
-            f"📺 Спортивные трансляции на {self.today.strftime('%d.%m.%Y')}",
+    def _generate_telegram_post(self):
+        if not self.strime_list:
+            return "🏟️ На сегодня спортивных трансляций не найдено 🏟️"
+
+        categorized = {}
+        for item in self.strime_list:
+            if item['category'] not in categorized:
+                categorized[item['category']] = []
+            categorized[item['category']].append(item)
+
+        category_emojis = {
+            "футбол": "⚽️",
+            "теннис": "🎾",
+            "хоккей": "🏒",
+            "баскетбол": "🏀",
+            "велоспорт": "🚴",
+            "гандбол": "🤾",
+            "регби": "🏉",
+            "бокс": "🥊",
+            "другое": "🏟️"
+        }
+
+        post_lines = [
+            f"🏟️ Спортивные трансляции на {self.today_str} 🏟️",
+            "",
+            "📅 Сегодня в эфире:",
             ""
         ]
+
+        preferred_order = ["футбол", "теннис", "хоккей", "баскетбол", "велоспорт", "регби", "гандбол", "бокс"]
+        sorted_categories = sorted(
+            categorized.keys(),
+            key=lambda x: preferred_order.index(x) if x in preferred_order else len(preferred_order))
         
-        for category, streams in grouped.items():
-            cat_data = self.categories.get(category, self.categories['другое'])
-            lines.append(f"{cat_data['emoji']} {category.upper()}")
+        for category in sorted_categories:
+            emoji = category_emojis.get(category, "🏟️")
+            post_lines.append(f"{emoji} {category.capitalize()}")
             
-            for stream in streams:
-                lines.append(f"🕒 {stream['time']} - {stream['name']}")
-                
-            lines.append("")
-            
-        lines.extend([
+            for item in categorized[category]:
+                post_lines.append(f"⏰ {item['time']} - {item['name']}")
+            post_lines.append("")
+
+        post_lines.extend([
             "📺 @Live_Strim_bot",
             "",
             "📌 Не пропустите интересные матчи!",
-            "#спорт #трансляции #спортивныйкалендарь #сегодня #трансляцииспорта #прямыетрансляции #спортивныетрансляции #трансляции"
+            "#спорт #трансляции #спортивныйкалендарь"
         ])
 
-        
-        return "\n".join(lines)
+        return "\n".join(post_lines)
 
-    def run(self):
-        """Основной метод запуска парсера"""
-        logger.info(f"Запуск парсера на {self.today.strftime('%d.%m.%Y')}")
+    def parse(self):
+        logger.info(f"Запуск парсера спортивных трансляций на {self.today_str}")
         
         try:
-            # Получение главной страницы
-            response = self.session.get(self.base_url, timeout=15)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            events = soup.find_all('article', class_='post')
-            
-            if not events:
-                logger.warning("События не найдены")
+            soup = self._get_page(CONFIG['base_url'])
+            if not soup:
+                raise Exception("Не удалось загрузить главную страницу")
+
+            posts_container = soup.find('div', id='aft-archive-wrapper')
+            if not posts_container:
+                raise Exception("Не найден контейнер с постами")
+
+            posts = posts_container.find_all('article', class_='af-sec-post')
+            if not posts:
+                logger.warning("Посты не найдены")
                 return
-                
-            logger.info(f"Найдено {len(events)} событий для обработки")
-            
-            # Многопоточная обработка
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                results = list(executor.map(self._process_event, events))
-                self.streams = [r for r in results if r]
-                
-            if self.streams:
-                # Сохранение результатов
+
+            logger.info(f"Найдено {len(posts)} постов для обработки")
+
+            with ThreadPoolExecutor(max_workers=CONFIG['max_workers']) as executor:
+                results = list(executor.map(self._process_post, posts))
+                self.strime_list = [r for r in results if r]
+
+            if self.strime_list:
                 with open('strimeList.json', 'w', encoding='utf-8') as f:
-                    json.dump(self.streams, f, ensure_ascii=False, indent=2)
-                    
-                # Генерация поста
-                post = self.generate_telegram_post()
+                    json.dump(self.strime_list, f, ensure_ascii=False, indent=2)
+                logger.info(f"Успешно сохранено {len(self.strime_list)} трансляций на сегодня")
+
+                telegram_post = self._generate_telegram_post()
                 with open('telegram_post.txt', 'w', encoding='utf-8') as f:
-                    f.write(post)
-                    
-                logger.info(f"Успешно обработано {len(self.streams)} трансляций")
-                print("\nРезультат:\n")
-                print(post)
-            else:
-                logger.info("Нет актуальных трансляций")
+                    f.write(telegram_post)
+                logger.info("Пост для Telegram успешно сгенерирован")
                 
+                print("\n" + "="*50)
+                print(telegram_post)
+                print("="*50 + "\n")
+            else:
+                logger.info("Нет трансляций на сегодня")
+
         except Exception as e:
-            logger.error(f"Критическая ошибка: {str(e)}")
+            logger.error(f"Критическая ошибка: {str(e)}", exc_info=True)
 
 if __name__ == '__main__':
     parser = SportStreamParser()
-    parser.run()
+    parser.parse()
